@@ -330,8 +330,6 @@ static int genpts = 0;
 static int lowres = 0;
 static int decoder_reorder_pts = -1;
 static int autoexit;
-static int exit_on_keydown;
-static int exit_on_mousedown;
 static int loop = 1;
 static int framedrop = -1;
 static int infinite_buffer = -1;
@@ -340,13 +338,9 @@ static const char *audio_codec_name;
 static const char *subtitle_codec_name;
 static const char *video_codec_name;
 double rdftspeed = 0.02;
-static int64_t cursor_last_shown;
-static int cursor_hidden = 0;
-#if CONFIG_AVFILTER
 static const char **vfilters_list = NULL;
 static int nb_vfilters = 0;
 static char *afilters = NULL;
-#endif
 static int autorotate = 1;
 
 /* current context */
@@ -3330,11 +3324,6 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
 	double remaining_time = 0.0;
 	SDL_PumpEvents();
 	while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT)) {
-		if (!cursor_hidden &&
-		    av_gettime_relative() - cursor_last_shown > CURSOR_HIDE_DELAY) {
-			SDL_ShowCursor(0);
-			cursor_hidden = 1;
-		}
 		if (remaining_time > 0.0)
 			av_usleep((int64_t)(remaining_time * 1000000.0));
 		remaining_time = REFRESH_RATE;
@@ -3383,10 +3372,6 @@ static void event_loop(VideoState *cur_stream)
 		refresh_loop_wait_event(cur_stream, &event);
 		switch (event.type) {
 		case SDL_KEYDOWN:
-			if (exit_on_keydown) {
-				do_exit(cur_stream);
-				break;
-			}
 			switch (event.key.keysym.sym) {
 			case SDLK_ESCAPE:
 			case SDLK_q:
@@ -3403,12 +3388,10 @@ static void event_loop(VideoState *cur_stream)
 			case SDLK_m:
 				toggle_mute(cur_stream);
 				break;
-			case SDLK_KP_MULTIPLY:
-			case SDLK_0:
+			case SDLK_UP:
 				update_volume(cur_stream, 1, SDL_VOLUME_STEP);
 				break;
-			case SDLK_KP_DIVIDE:
-			case SDLK_9:
+			case SDLK_DOWN:
 				update_volume(cur_stream, -1, SDL_VOLUME_STEP);
 				break;
 			case SDLK_s: // S: Step to next frame
@@ -3429,7 +3412,6 @@ static void event_loop(VideoState *cur_stream)
 				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_SUBTITLE);
 				break;
 			case SDLK_w:
-#if CONFIG_AVFILTER
 				if (cur_stream->show_mode == SHOW_MODE_VIDEO &&
 				    cur_stream->vfilter_idx < nb_vfilters - 1) {
 					if (++cur_stream->vfilter_idx >= nb_vfilters)
@@ -3438,9 +3420,6 @@ static void event_loop(VideoState *cur_stream)
 					cur_stream->vfilter_idx = 0;
 					toggle_audio_display(cur_stream);
 				}
-#else
-				toggle_audio_display(cur_stream);
-#endif
 				break;
 			case SDLK_PAGEUP:
 				if (cur_stream->ic->nb_chapters <= 1) {
@@ -3462,11 +3441,6 @@ static void event_loop(VideoState *cur_stream)
 			case SDLK_RIGHT:
 				incr = 10.0;
 				goto do_seek;
-			case SDLK_UP:
-				incr = 60.0;
-				goto do_seek;
-			case SDLK_DOWN:
-				incr = -60.0;
 do_seek:
 				if (seek_by_bytes) {
 					pos = -1;
@@ -3499,10 +3473,6 @@ do_seek:
 			}
 			break;
 		case SDL_MOUSEBUTTONDOWN:
-			if (exit_on_mousedown) {
-				do_exit(cur_stream);
-				break;
-			}
 			if (event.button.button == SDL_BUTTON_LEFT) {
 				static int64_t last_mouse_left_click = 0;
 				if (av_gettime_relative() - last_mouse_left_click <= 500000) {
@@ -3514,11 +3484,6 @@ do_seek:
 				}
 			}
 		case SDL_MOUSEMOTION:
-			if (cursor_hidden) {
-				SDL_ShowCursor(1);
-				cursor_hidden = 0;
-			}
-			cursor_last_shown = av_gettime_relative();
 			if (event.type == SDL_MOUSEBUTTONDOWN) {
 				if (event.button.button != SDL_BUTTON_RIGHT)
 					break;
@@ -3713,8 +3678,6 @@ static const OptionDef options[] = {
 	{ "lowres", OPT_INT | HAS_ARG | OPT_EXPERT, { &lowres }, "", "" },
 	{ "sync", HAS_ARG | OPT_EXPERT, { .func_arg = opt_sync }, "set audio-video sync. type (type=audio/video/ext)", "type" },
 	{ "autoexit", OPT_BOOL | OPT_EXPERT, { &autoexit }, "exit at the end", "" },
-	{ "exitonkeydown", OPT_BOOL | OPT_EXPERT, { &exit_on_keydown }, "exit on key down", "" },
-	{ "exitonmousedown", OPT_BOOL | OPT_EXPERT, { &exit_on_mousedown }, "exit on mouse down", "" },
 	{ "loop", OPT_INT | HAS_ARG | OPT_EXPERT, { &loop }, "set number of times the playback shall be looped", "loop count" },
 	{ "framedrop", OPT_BOOL | OPT_EXPERT, { &framedrop }, "drop frames when cpu is too slow", "" },
 	{ "infbuf", OPT_BOOL | OPT_EXPERT, { &infinite_buffer }, "don't limit the input buffer size (useful with realtime streams)", "" },
