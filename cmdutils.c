@@ -304,38 +304,6 @@ int parse_option(void *optctx, const char *opt, const char *arg,
 	return !!(po->flags & HAS_ARG);
 }
 
-void parse_options(void *optctx, int argc, char **argv,
-                   const OptionDef *options,
-                   void (*parse_arg_function)(void *, const char*))
-{
-	const char *opt;
-	int optindex, handleoptions = 1, ret;
-
-	/* perform system-dependent conversions for arguments list */
-	prepare_app_arguments(&argc, &argv);
-
-	/* parse options */
-	optindex = 1;
-	while (optindex < argc) {
-		opt = argv[optindex++];
-
-		if (handleoptions && opt[0] == '-' && opt[1] != '\0') {
-			if (opt[1] == '-' && opt[2] == '\0') {
-				handleoptions = 0;
-				continue;
-			}
-			opt++;
-
-			if ((ret = parse_option(optctx, opt, argv[optindex], options)) < 0)
-				exit_program(1);
-			optindex += ret;
-		} else {
-			if (parse_arg_function)
-				parse_arg_function(optctx, opt);
-		}
-	}
-}
-
 int parse_optgroup(void *optctx, OptionGroup *g)
 {
 	int i, ret;
@@ -995,17 +963,6 @@ static void print_buildconf(int flags, int level)
 		av_log(NULL, level, "%s%s%s\n", indent, indent, splitconf);
 		splitconf = strtok(NULL, "~");
 	}
-}
-
-void show_banner(int argc, char **argv, const OptionDef *options)
-{
-	int idx = locate_option(argc, argv, options, "version");
-	if (hide_banner || idx)
-		return;
-
-	print_program_info(INDENT | SHOW_COPYRIGHT, AV_LOG_INFO);
-	print_all_libs_info(INDENT | SHOW_CONFIG,  AV_LOG_INFO);
-	print_all_libs_info(INDENT | SHOW_VERSION, AV_LOG_INFO);
 }
 
 int show_version(void *optctx, const char *opt, const char *arg)
@@ -1734,40 +1691,6 @@ static void show_help_filter(const char *name)
 #endif
 }
 #endif
-
-int show_help(void *optctx, const char *opt, const char *arg)
-{
-	char *topic, *par;
-	av_log_set_callback(log_callback_help);
-
-	topic = av_strdup(arg ? arg : "");
-	if (!topic)
-		return AVERROR(ENOMEM);
-	par = strchr(topic, '=');
-	if (par)
-		*par++ = 0;
-
-	if (!*topic) {
-		show_help_default(topic, par);
-	} else if (!strcmp(topic, "decoder")) {
-		show_help_codec(par, 0);
-	} else if (!strcmp(topic, "encoder")) {
-		show_help_codec(par, 1);
-	} else if (!strcmp(topic, "demuxer")) {
-		show_help_demuxer(par);
-	} else if (!strcmp(topic, "muxer")) {
-		show_help_muxer(par);
-#if CONFIG_AVFILTER
-	} else if (!strcmp(topic, "filter")) {
-		show_help_filter(par);
-#endif
-	} else {
-		show_help_default(topic, par);
-	}
-
-	av_freep(&topic);
-	return 0;
-}
 
 int read_yesno(void)
 {
