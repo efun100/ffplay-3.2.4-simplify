@@ -212,7 +212,6 @@ typedef struct VideoState {
 	int64_t seek_rel;
 	int read_pause_return;
 	AVFormatContext *ic;
-	int realtime;
 
 	Clock audclk;
 	Clock vidclk;
@@ -246,7 +245,6 @@ typedef struct VideoState {
 	int audio_buf_index; /* in bytes */
 	int audio_write_buf_size;
 	int audio_volume;
-	int muted;
 	struct AudioParams audio_src;
 	struct AudioParams audio_filter_src;
 	struct AudioParams audio_tgt;
@@ -1435,11 +1433,6 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel,
 	}
 }
 
-static void toggle_mute(VideoState *is)
-{
-	is->muted = !is->muted;
-}
-
 static void update_volume(VideoState *is, int sign, int step)
 {
 	is->audio_volume = av_clip(is->audio_volume + sign * step, 0,
@@ -1505,9 +1498,6 @@ static void video_refresh(void *opaque, double *remaining_time)
 	double time;
 
 	Frame *sp, *sp2;
-
-	if (get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
-		check_external_clock_speed(is);
 
 	if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
 		time = av_gettime_relative() / 1000000.0;
@@ -1786,7 +1776,6 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
 	return got_picture;
 }
 
-#if CONFIG_AVFILTER
 static int configure_filtergraph(AVFilterGraph *graph, const char *filtergraph,
                                  AVFilterContext *source_ctx, AVFilterContext *sink_ctx)
 {
@@ -2010,7 +1999,6 @@ end:
 		avfilter_graph_free(&is->agraph);
 	return ret;
 }
-#endif  /* CONFIG_AVFILTER */
 
 static int audio_thread(void *arg)
 {
@@ -2457,11 +2445,11 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 		len1 = is->audio_buf_size - is->audio_buf_index;
 		if (len1 > len)
 			len1 = len;
-		if (!is->muted && is->audio_buf && is->audio_volume == SDL_MIX_MAXVOLUME)
+		if (is->audio_buf && is->audio_volume == SDL_MIX_MAXVOLUME)
 			memcpy(stream, (uint8_t *)is->audio_buf + is->audio_buf_index, len1);
 		else {
 			memset(stream, 0, len1);
-			if (!is->muted && is->audio_buf)
+			if (is->audio_buf)
 				SDL_MixAudio(stream, (uint8_t *)is->audio_buf + is->audio_buf_index, len1,
 				             is->audio_volume);
 		}
@@ -2747,22 +2735,6 @@ static int stream_has_enough_packets(AVStream *st, int stream_id,
 	               av_q2d(st->time_base) * queue->duration > 1.0);
 }
 
-static int is_realtime(AVFormatContext *s)
-{
-	if (!strcmp(s->iformat->name, "rtp")
-	    || !strcmp(s->iformat->name, "rtsp")
-	    || !strcmp(s->iformat->name, "sdp")
-	   )
-		return 1;
-
-	if (s->pb && (!strncmp(s->filename, "rtp:", 4)
-	              || !strncmp(s->filename, "udp:", 4)
-	             )
-	   )
-		return 1;
-	return 0;
-}
-
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -2870,8 +2842,6 @@ static int read_thread(void *arg)
 		}
 	}
 
-	is->realtime = is_realtime(ic);
-
 	if (show_status)
 		av_dump_format(ic, 0, is->filename, 0);
 
@@ -2942,9 +2912,6 @@ static int read_thread(void *arg)
 		ret = -1;
 		goto fail;
 	}
-
-	if (infinite_buffer < 0 && is->realtime)
-		infinite_buffer = 1;
 
 	while (1) {
 		if (is->abort_request)
@@ -3115,7 +3082,6 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 	init_clock(&is->extclk, &is->extclk.serial);
 	is->audio_clock_serial = -1;
 	is->audio_volume = SDL_MIX_MAXVOLUME;
-	is->muted = 0;
 	is->av_sync_type = av_sync_type;
 	is->read_tid     = SDL_CreateThread(read_thread, "read_thread", is);
 	if (!is->read_tid) {
@@ -3125,103 +3091,6 @@ fail:
 		return NULL;
 	}
 	return is;
-}
-
-static void stream_cycle_channel(VideoState *is, int codec_type)
-{
-	AVFormatContext *ic = is->ic;
-	int start_index, stream_index;
-	int old_index;
-	AVStream *st;
-	AVProgram *p = NULL;
-	int nb_streams = is->ic->nb_streams;
-
-	if (codec_type == AVMEDIA_TYPE_VIDEO) {
-		start_index = is->last_video_stream;
-		old_index = is->video_stream;
-	} else if (codec_type == AVMEDIA_TYPE_AUDIO) {
-		start_index = is->last_audio_stream;
-		old_index = is->audio_stream;
-	} else {
-		start_index = is->last_subtitle_stream;
-		old_index = is->subtitle_stream;
-	}
-	stream_index = start_index;
-
-	if (codec_type != AVMEDIA_TYPE_VIDEO && is->video_stream != -1) {
-		p = av_find_program_from_stream(ic, NULL, is->video_stream);
-		if (p) {
-			nb_streams = p->nb_stream_indexes;
-			for (start_index = 0; start_index < nb_streams; start_index++)
-				if (p->stream_index[start_index] == stream_index)
-					break;
-			if (start_index == nb_streams)
-				start_index = -1;
-			stream_index = start_index;
-		}
-	}
-
-	while (1) {
-		if (++stream_index >= nb_streams) {
-			if (codec_type == AVMEDIA_TYPE_SUBTITLE) {
-				stream_index = -1;
-				is->last_subtitle_stream = -1;
-				goto the_end;
-			}
-			if (start_index == -1)
-				return;
-			stream_index = 0;
-		}
-		if (stream_index == start_index)
-			return;
-		st = is->ic->streams[p ? p->stream_index[stream_index] : stream_index];
-		if (st->codecpar->codec_type == codec_type) {
-			/* check that parameters are OK */
-			switch (codec_type) {
-			case AVMEDIA_TYPE_AUDIO:
-				if (st->codecpar->sample_rate != 0 &&
-				    st->codecpar->channels != 0)
-					goto the_end;
-				break;
-			case AVMEDIA_TYPE_VIDEO:
-			case AVMEDIA_TYPE_SUBTITLE:
-				goto the_end;
-			default:
-				break;
-			}
-		}
-	}
-the_end:
-	if (p && stream_index != -1)
-		stream_index = p->stream_index[stream_index];
-	av_log(NULL, AV_LOG_INFO, "Switch %s stream from #%d to #%d\n",
-	       av_get_media_type_string(codec_type),
-	       old_index,
-	       stream_index);
-
-	stream_component_close(is, old_index);
-	stream_component_open(is, stream_index);
-}
-
-
-static void toggle_full_screen(VideoState *is)
-{
-	is_full_screen = !is_full_screen;
-	SDL_SetWindowFullscreen(window,
-	                        is_full_screen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-}
-
-static void toggle_audio_display(VideoState *is)
-{
-	int next = is->show_mode;
-	do {
-		next = (next + 1) % SHOW_MODE_NB;
-	} while (next != is->show_mode && (next == SHOW_MODE_VIDEO && !is->video_st ||
-	                                   next != SHOW_MODE_VIDEO && !is->audio_st));
-	if (is->show_mode != next) {
-		is->force_refresh = 1;
-		is->show_mode = next;
-	}
 }
 
 static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
@@ -3236,34 +3105,6 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
 			video_refresh(is, &remaining_time);
 		SDL_PumpEvents();
 	}
-}
-
-static void seek_chapter(VideoState *is, int incr)
-{
-	int64_t pos = get_master_clock(is) * AV_TIME_BASE;
-	int i;
-
-	if (!is->ic->nb_chapters)
-		return;
-
-	/* find the current chapter */
-	for (i = 0; i < is->ic->nb_chapters; i++) {
-		AVChapter *ch = is->ic->chapters[i];
-		if (av_compare_ts(pos, AV_TIME_BASE_Q, ch->start, ch->time_base) < 0) {
-			i--;
-			break;
-		}
-	}
-
-	i += incr;
-	i = FFMAX(i, 0);
-	if (i >= is->ic->nb_chapters)
-		return;
-
-	av_log(NULL, AV_LOG_VERBOSE, "Seeking to chapter %d.\n", i);
-	stream_seek(is, av_rescale_q(is->ic->chapters[i]->start,
-	                             is->ic->chapters[i]->time_base,
-	                             AV_TIME_BASE_Q), 0, 0);
 }
 
 /* handle an event sent by the GUI */
@@ -3282,56 +3123,11 @@ static void event_loop(VideoState *cur_stream)
 			case SDLK_q:
 				do_exit(cur_stream);
 				break;
-			case SDLK_f:
-				toggle_full_screen(cur_stream);
-				cur_stream->force_refresh = 1;
-				break;
-			case SDLK_m:
-				toggle_mute(cur_stream);
-				break;
 			case SDLK_UP:
 				update_volume(cur_stream, 1, SDL_VOLUME_STEP);
 				break;
 			case SDLK_DOWN:
 				update_volume(cur_stream, -1, SDL_VOLUME_STEP);
-				break;
-			case SDLK_a:
-				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_AUDIO);
-				break;
-			case SDLK_v:
-				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_VIDEO);
-				break;
-			case SDLK_c:
-				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_VIDEO);
-				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_AUDIO);
-				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_SUBTITLE);
-				break;
-			case SDLK_t:
-				stream_cycle_channel(cur_stream, AVMEDIA_TYPE_SUBTITLE);
-				break;
-			case SDLK_w:
-				if (cur_stream->show_mode == SHOW_MODE_VIDEO &&
-				    cur_stream->vfilter_idx < nb_vfilters - 1) {
-					if (++cur_stream->vfilter_idx >= nb_vfilters)
-						cur_stream->vfilter_idx = 0;
-				} else {
-					cur_stream->vfilter_idx = 0;
-					toggle_audio_display(cur_stream);
-				}
-				break;
-			case SDLK_PAGEUP:
-				if (cur_stream->ic->nb_chapters <= 1) {
-					incr = 600.0;
-					goto do_seek;
-				}
-				seek_chapter(cur_stream, 1);
-				break;
-			case SDLK_PAGEDOWN:
-				if (cur_stream->ic->nb_chapters <= 1) {
-					incr = -600.0;
-					goto do_seek;
-				}
-				seek_chapter(cur_stream, -1);
 				break;
 			case SDLK_LEFT:
 				incr = -10.0;
@@ -3370,17 +3166,6 @@ do_seek:
 				break;
 			}
 			break;
-		case SDL_MOUSEBUTTONDOWN:
-			if (event.button.button == SDL_BUTTON_LEFT) {
-				static int64_t last_mouse_left_click = 0;
-				if (av_gettime_relative() - last_mouse_left_click <= 500000) {
-					toggle_full_screen(cur_stream);
-					cur_stream->force_refresh = 1;
-					last_mouse_left_click = 0;
-				} else {
-					last_mouse_left_click = av_gettime_relative();
-				}
-			}
 		case SDL_MOUSEMOTION:
 			if (event.type == SDL_MOUSEBUTTONDOWN) {
 				if (event.button.button != SDL_BUTTON_RIGHT)
@@ -3443,120 +3228,7 @@ do_seek:
 	}
 }
 
-static int opt_frame_size(void *optctx, const char *opt, const char *arg)
-{
-	av_log(NULL, AV_LOG_WARNING, "Option -s is deprecated, use -video_size.\n");
-	return opt_default(NULL, "video_size", arg);
-}
-
-static int opt_width(void *optctx, const char *opt, const char *arg)
-{
-	screen_width = parse_number_or_die(opt, arg, OPT_INT64, 1, INT_MAX);
-	return 0;
-}
-
-static int opt_height(void *optctx, const char *opt, const char *arg)
-{
-	screen_height = parse_number_or_die(opt, arg, OPT_INT64, 1, INT_MAX);
-	return 0;
-}
-
-static int opt_format(void *optctx, const char *opt, const char *arg)
-{
-	file_iformat = av_find_input_format(arg);
-	if (!file_iformat) {
-		av_log(NULL, AV_LOG_FATAL, "Unknown input format: %s\n", arg);
-		return AVERROR(EINVAL);
-	}
-	return 0;
-}
-
-static int opt_frame_pix_fmt(void *optctx, const char *opt, const char *arg)
-{
-	av_log(NULL, AV_LOG_WARNING,
-	       "Option -pix_fmt is deprecated, use -pixel_format.\n");
-	return opt_default(NULL, "pixel_format", arg);
-}
-
-static int opt_sync(void *optctx, const char *opt, const char *arg)
-{
-	if (!strcmp(arg, "audio"))
-		av_sync_type = AV_SYNC_AUDIO_MASTER;
-	else if (!strcmp(arg, "video"))
-		av_sync_type = AV_SYNC_VIDEO_MASTER;
-	else if (!strcmp(arg, "ext"))
-		av_sync_type = AV_SYNC_EXTERNAL_CLOCK;
-	else {
-		av_log(NULL, AV_LOG_ERROR, "Unknown value for %s: %s\n", opt, arg);
-		exit(1);
-	}
-	return 0;
-}
-
-static int opt_seek(void *optctx, const char *opt, const char *arg)
-{
-	start_time = parse_time_or_die(opt, arg, 1);
-	return 0;
-}
-
-static int opt_duration(void *optctx, const char *opt, const char *arg)
-{
-	duration = parse_time_or_die(opt, arg, 1);
-	return 0;
-}
-
-static int opt_show_mode(void *optctx, const char *opt, const char *arg)
-{
-	show_mode = !strcmp(arg, "video") ? SHOW_MODE_VIDEO :
-	            !strcmp(arg, "waves") ? SHOW_MODE_WAVES :
-	            !strcmp(arg, "rdft") ? SHOW_MODE_RDFT  :
-	            parse_number_or_die(opt, arg, OPT_INT, 0, SHOW_MODE_NB - 1);
-	return 0;
-}
-
-static void opt_input_file(void *optctx, const char *filename)
-{
-	if (input_filename) {
-		av_log(NULL, AV_LOG_FATAL,
-		       "Argument '%s' provided as input filename, but '%s' was already specified.\n",
-		       filename, input_filename);
-		exit(1);
-	}
-	if (!strcmp(filename, "-"))
-		filename = "pipe:";
-	input_filename = filename;
-}
-
-static int opt_codec(void *optctx, const char *opt, const char *arg)
-{
-	const char *spec = strchr(opt, ':');
-	if (!spec) {
-		av_log(NULL, AV_LOG_ERROR,
-		       "No media specifier was specified in '%s' in option '%s'\n",
-		       arg, opt);
-		return AVERROR(EINVAL);
-	}
-	spec++;
-	switch (spec[0]) {
-	case 'a' :    audio_codec_name = arg; break;
-	case 's' : subtitle_codec_name = arg; break;
-	case 'v' :    video_codec_name = arg; break;
-	default:
-		av_log(NULL, AV_LOG_ERROR,
-		       "Invalid media specifier '%s' in option '%s'\n", spec, opt);
-		return AVERROR(EINVAL);
-	}
-	return 0;
-}
-
 static int dummy;
-
-static void show_usage(void)
-{
-	av_log(NULL, AV_LOG_INFO, "Simple media player\n");
-	av_log(NULL, AV_LOG_INFO, "usage: %s [options] input_file\n", program_name);
-	av_log(NULL, AV_LOG_INFO, "\n");
-}
 
 static int lockmgr(void **mtx, enum AVLockOp op)
 {
@@ -3605,7 +3277,6 @@ int main(int argc, char **argv)
 	}
 	input_filename = argv[1];
 	if (!input_filename) {
-		show_usage();
 		av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
 		exit(1);
 	}
@@ -3650,6 +3321,5 @@ int main(int argc, char **argv)
 	event_loop(is);
 
 	/* never returns */
-
 	return 0;
 }
