@@ -82,19 +82,9 @@ typedef struct OptionDef {
 } OptionDef;
 
 /**
- * Register a program-specific cleanup routine.
- */
-void register_exit(void (*cb)(int ret));
-
-/**
  * Wraps exit with a program-specific cleanup routine.
  */
 void exit_program(int ret) av_noreturn;
-
-/**
- * Initialize dynamic library loading
- */
-void init_dynload(void);
 
 /**
  * Initialize the cmdutils option system, in particular
@@ -106,39 +96,6 @@ void init_opts(void);
  * free the *_opts contexts and their contents.
  */
 void uninit_opts(void);
-
-/**
- * Parse a string and return its corresponding value as a double.
- * Exit from the application if the string cannot be correctly
- * parsed or the corresponding value is invalid.
- *
- * @param context the context of the value to be set (e.g. the
- * corresponding command line option name)
- * @param numstr the string to be parsed
- * @param type the type (OPT_INT64 or OPT_FLOAT) as which the
- * string should be parsed
- * @param min the minimum valid accepted value
- * @param max the maximum valid accepted value
- */
-double parse_number_or_die(const char *context, const char *numstr, int type,
-                           double min, double max);
-
-/**
- * Parse a string specifying a time and return its corresponding
- * value as a number of microseconds. Exit from the application if
- * the string cannot be correctly parsed.
- *
- * @param context the context of the value to be set (e.g. the
- * corresponding command line option name)
- * @param timestr the string to be parsed
- * @param is_duration a flag which tells how to interpret timestr, if
- * not zero timestr is interpreted as a duration, otherwise as a
- * date
- *
- * @see av_parse_time()
- */
-int64_t parse_time_or_die(const char *context, const char *timestr,
-                          int is_duration);
 
 /**
  * Check if the given stream matches a stream specifier.
@@ -193,41 +150,6 @@ AVDictionary **setup_find_stream_info_opts(AVFormatContext *s,
  */
 void print_error(const char *filename, int err);
 
-/**
- * Realloc array to hold new_size elements of elem_size.
- * Calls exit() on failure.
- *
- * @param array array to reallocate
- * @param elem_size size in bytes of each element
- * @param size new element count will be written here
- * @param new_size number of elements to place in reallocated array
- * @return reallocated array
- */
-void *grow_array(void *array, int elem_size, int *size, int new_size);
-
 #define media_type_string av_get_media_type_string
-
-#define GROW_ARRAY(array, nb_elems)\
-    array = grow_array(array, sizeof(*array), &nb_elems, nb_elems + 1)
-
-#define GET_PIX_FMT_NAME(pix_fmt)\
-    const char *name = av_get_pix_fmt_name(pix_fmt);
-
-#define GET_SAMPLE_FMT_NAME(sample_fmt)\
-    const char *name = av_get_sample_fmt_name(sample_fmt)
-
-#define GET_SAMPLE_RATE_NAME(rate)\
-    char name[16];\
-    snprintf(name, sizeof(name), "%d", rate);
-
-#define GET_CH_LAYOUT_NAME(ch_layout)\
-    char name[16];\
-    snprintf(name, sizeof(name), "0x%"PRIx64, ch_layout);
-
-#define GET_CH_LAYOUT_DESC(ch_layout)\
-    char name[128];\
-    av_get_channel_layout_string(name, sizeof(name), 0, ch_layout);
-
-double get_rotation(AVStream *st);
 
 #endif /* CMDUTILS_H */

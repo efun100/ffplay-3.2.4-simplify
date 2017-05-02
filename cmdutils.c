@@ -44,7 +44,6 @@
 #include "libavutil/display.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/imgutils.h"
-//#include "libavutil/libm.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/eval.h"
@@ -77,55 +76,12 @@ void uninit_opts(void)
 
 static void (*program_exit)(int ret);
 
-void register_exit(void (*cb)(int ret))
-{
-	program_exit = cb;
-}
-
 void exit_program(int ret)
 {
 	if (program_exit)
 		program_exit(ret);
 
 	exit(ret);
-}
-
-double parse_number_or_die(const char *context, const char *numstr, int type,
-                           double min, double max)
-{
-	char *tail;
-	const char *error;
-	double d = av_strtod(numstr, &tail);
-	if (*tail)
-		error = "Expected number for %s but found: %s\n";
-	else if (d < min || d > max)
-		error = "The value for %s was %s which is not within %f - %f\n";
-	else if (type == OPT_INT64 && (int64_t)d != d)
-		error = "Expected int64 for %s but found %s\n";
-	else if (type == OPT_INT && (int)d != d)
-		error = "Expected int for %s but found %s\n";
-	else
-		return d;
-	av_log(NULL, AV_LOG_FATAL, error, context, numstr, min, max);
-	exit_program(1);
-	return 0;
-}
-
-int64_t parse_time_or_die(const char *context, const char *timestr,
-                          int is_duration)
-{
-	int64_t us;
-	if (av_parse_time(&us, timestr, is_duration) < 0) {
-		av_log(NULL, AV_LOG_FATAL, "Invalid %s specification for %s: %s\n",
-		       is_duration ? "duration" : "date", context, timestr);
-		exit_program(1);
-	}
-	return us;
-}
-
-static inline void prepare_app_arguments(int *argc_ptr, char ***argv_ptr)
-{
-	/* nothing to do */
 }
 
 void print_error(const char *filename, int err)
@@ -137,13 +93,6 @@ void print_error(const char *filename, int err)
 		errbuf_ptr = strerror(AVUNERROR(err));
 	av_log(NULL, AV_LOG_ERROR, "%s: %s\n", filename, errbuf_ptr);
 }
-
-static int warned_cfg = 0;
-
-#define INDENT        1
-#define SHOW_VERSION  2
-#define SHOW_CONFIG   4
-#define SHOW_COPYRIGHT 8
 
 int check_stream_specifier(AVFormatContext *s, AVStream *st, const char *spec)
 {
@@ -228,50 +177,4 @@ AVDictionary **setup_find_stream_info_opts(AVFormatContext *s,
 		opts[i] = filter_codec_opts(codec_opts, s->streams[i]->codecpar->codec_id,
 		                            s, s->streams[i], NULL);
 	return opts;
-}
-
-void *grow_array(void *array, int elem_size, int *size, int new_size)
-{
-	if (new_size >= INT_MAX / elem_size) {
-		av_log(NULL, AV_LOG_ERROR, "Array too big.\n");
-		exit_program(1);
-	}
-	if (*size < new_size) {
-		uint8_t *tmp = av_realloc_array(array, new_size, elem_size);
-		if (!tmp) {
-			av_log(NULL, AV_LOG_ERROR, "Could not alloc buffer.\n");
-			exit_program(1);
-		}
-		memset(tmp + *size * elem_size, 0, (new_size - *size) * elem_size);
-		*size = new_size;
-		return tmp;
-	}
-	return array;
-}
-
-double get_rotation(AVStream *st)
-{
-	AVDictionaryEntry *rotate_tag = av_dict_get(st->metadata, "rotate", NULL, 0);
-	uint8_t* displaymatrix = av_stream_get_side_data(st,
-	                         AV_PKT_DATA_DISPLAYMATRIX, NULL);
-	double theta = 0;
-
-	if (rotate_tag && *rotate_tag->value && strcmp(rotate_tag->value, "0")) {
-		char *tail;
-		theta = av_strtod(rotate_tag->value, &tail);
-		if (*tail)
-			theta = 0;
-	}
-	if (displaymatrix && !theta)
-		theta = -av_display_rotation_get((int32_t*) displaymatrix);
-
-	theta -= 360 * floor(theta / 360 + 0.9 / 360);
-
-	if (fabs(theta - 90 * round(theta / 90)) > 2)
-		av_log(NULL, AV_LOG_WARNING, "Odd rotation angle.\n"
-		       "If you want to help, upload a sample "
-		       "of this file to ftp://upload.ffmpeg.org/incoming/ "
-		       "and contact the ffmpeg-devel mailing list. (ffmpeg-devel@ffmpeg.org)");
-
-	return theta;
 }

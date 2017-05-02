@@ -330,10 +330,8 @@ double rdftspeed = 0.02;
 static const char **vfilters_list = NULL;
 static int nb_vfilters = 0;
 static char *afilters = NULL;
-static int autorotate = 1;
 
 /* current context */
-static int is_full_screen;
 static int64_t audio_callback_time;
 
 static AVPacket flush_pkt;
@@ -343,15 +341,6 @@ static AVPacket flush_pkt;
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
-
-#if CONFIG_AVFILTER
-static int opt_add_vfilter(void *optctx, const char *opt, const char *arg)
-{
-	GROW_ARRAY(vfilters_list, nb_vfilters);
-	vfilters_list[nb_vfilters - 1] = arg;
-	return 0;
-}
-#endif
 
 static inline
 int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
@@ -1269,8 +1258,6 @@ static int video_open(VideoState *is, Frame *vp)
 		int flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
 		if (!window_title)
 			window_title = input_filename;
-		if (is_full_screen)
-			flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 		window = SDL_CreateWindow(window_title, SDL_WINDOWPOS_UNDEFINED,
 		                          SDL_WINDOWPOS_UNDEFINED, w, h, flags);
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
@@ -1396,26 +1383,6 @@ static double get_master_clock(VideoState *is)
 		break;
 	}
 	return val;
-}
-
-static void check_external_clock_speed(VideoState *is)
-{
-	if (is->video_stream >= 0 &&
-	    is->videoq.nb_packets <= EXTERNAL_CLOCK_MIN_FRAMES ||
-	    is->audio_stream >= 0 && is->audioq.nb_packets <= EXTERNAL_CLOCK_MIN_FRAMES) {
-		set_clock_speed(&is->extclk, FFMAX(EXTERNAL_CLOCK_SPEED_MIN,
-		                                   is->extclk.speed - EXTERNAL_CLOCK_SPEED_STEP));
-	} else if ((is->video_stream < 0 ||
-	            is->videoq.nb_packets > EXTERNAL_CLOCK_MAX_FRAMES) &&
-	           (is->audio_stream < 0 || is->audioq.nb_packets > EXTERNAL_CLOCK_MAX_FRAMES)) {
-		set_clock_speed(&is->extclk, FFMIN(EXTERNAL_CLOCK_SPEED_MAX,
-		                                   is->extclk.speed + EXTERNAL_CLOCK_SPEED_STEP));
-	} else {
-		double speed = is->extclk.speed;
-		if (speed != 1.0)
-			set_clock_speed(&is->extclk,
-			                speed + EXTERNAL_CLOCK_SPEED_STEP * (1.0 - speed) / fabs(1.0 - speed));
-	}
 }
 
 /* seek in the stream */
@@ -1869,41 +1836,6 @@ static int configure_video_filters(AVFilterGraph *graph, VideoState *is,
 		goto fail;
 
 	last_filter = filt_out;
-
-	/* Note: this macro adds a filter before the lastly added filter, so the
-	 * processing order of the filters is in reverse */
-#define INSERT_FILT(name, arg) do {                                          \
-    AVFilterContext *filt_ctx;                                               \
-                                                                             \
-    ret = avfilter_graph_create_filter(&filt_ctx,                            \
-                                       avfilter_get_by_name(name),           \
-                                       "ffplay_" name, arg, NULL, graph);    \
-    if (ret < 0)                                                             \
-        goto fail;                                                           \
-                                                                             \
-    ret = avfilter_link(filt_ctx, 0, last_filter, 0);                        \
-    if (ret < 0)                                                             \
-        goto fail;                                                           \
-                                                                             \
-    last_filter = filt_ctx;                                                  \
-} while (0)
-
-	if (autorotate) {
-		double theta  = get_rotation(is->video_st);
-
-		if (fabs(theta - 90) < 1.0) {
-			INSERT_FILT("transpose", "clock");
-		} else if (fabs(theta - 180) < 1.0) {
-			INSERT_FILT("hflip", NULL);
-			INSERT_FILT("vflip", NULL);
-		} else if (fabs(theta - 270) < 1.0) {
-			INSERT_FILT("transpose", "cclock");
-		} else if (fabs(theta) > 1.0) {
-			char rotate_buf[64];
-			snprintf(rotate_buf, sizeof(rotate_buf), "%f*PI/180", theta);
-			INSERT_FILT("rotate", rotate_buf);
-		}
-	}
 
 	if ((ret = configure_filtergraph(graph, vfilters, filt_src, last_filter)) < 0)
 		goto fail;
@@ -2636,9 +2568,7 @@ static int stream_component_open(VideoState *is, int stream_index)
 	is->eof = 0;
 	ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
 	switch (avctx->codec_type) {
-	case AVMEDIA_TYPE_AUDIO:
-#if CONFIG_AVFILTER
-	{
+	case AVMEDIA_TYPE_AUDIO: {
 		AVFilterLink *link;
 
 		is->audio_filter_src.freq           = avctx->sample_rate;
@@ -2653,11 +2583,6 @@ static int stream_component_open(VideoState *is, int stream_index)
 		nb_channels    = avfilter_link_get_channels(link);
 		channel_layout = link->channel_layout;
 	}
-#else
-	sample_rate    = avctx->sample_rate;
-	nb_channels    = avctx->channels;
-	channel_layout = avctx->channel_layout;
-#endif
 
 		/* prepare audio output */
 	if ((ret = audio_open(is, channel_layout, nb_channels, sample_rate,
@@ -3227,8 +3152,6 @@ do_seek:
 		}
 	}
 }
-
-static int dummy;
 
 static int lockmgr(void **mtx, enum AVLockOp op)
 {
