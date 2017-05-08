@@ -91,11 +91,6 @@ void exit_program(int ret) av_noreturn;
  * allocate the *_opts contexts.
  */
 void init_opts(void);
-/**
- * Uninitialize the cmdutils option system, in particular
- * free the *_opts contexts and their contents.
- */
-void uninit_opts(void);
 
 /**
  * Check if the given stream matches a stream specifier.

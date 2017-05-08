@@ -65,15 +65,6 @@ void init_opts(void)
 	av_dict_set(&sws_dict, "flags", "bicubic", 0);
 }
 
-void uninit_opts(void)
-{
-	av_dict_free(&swr_opts);
-	av_dict_free(&sws_dict);
-	av_dict_free(&format_opts);
-	av_dict_free(&codec_opts);
-	av_dict_free(&resample_opts);
-}
-
 static void (*program_exit)(int ret);
 
 void exit_program(int ret)
