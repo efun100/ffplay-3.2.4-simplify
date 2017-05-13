@@ -23,7 +23,6 @@
  * simple media player based on the FFmpeg libraries
  */
 
-#include "config.h"
 #include <inttypes.h>
 #include <math.h>
 #include <limits.h>
@@ -102,8 +101,6 @@ const int program_birth_year = 2003;
 #define SAMPLE_ARRAY_SIZE (8 * 65536)
 
 #define CURSOR_HIDE_DELAY 1000000
-
-#define USE_ONEPASS_SUBTITLE_RENDER 1
 
 static unsigned sws_flags = SWS_BICUBIC;
 
@@ -894,22 +891,7 @@ static void video_image_display(VideoState *is)
 
 		SDL_RenderCopy(renderer, vp->bmp, NULL, &rect);
 		if (sp) {
-#if USE_ONEPASS_SUBTITLE_RENDER
 			SDL_RenderCopy(renderer, is->sub_texture, NULL, &rect);
-#else
-			int i;
-			double xratio = (double)rect.w / (double)sp->width;
-			double yratio = (double)rect.h / (double)sp->height;
-			for (i = 0; i < sp->sub.num_rects; i++) {
-				SDL_Rect *sub_rect = (SDL_Rect *)sp->sub.rects[i];
-				SDL_Rect target = {.x = rect.x + sub_rect->x * xratio,
-				                   .y = rect.y + sub_rect->y * yratio,
-				                   .w = sub_rect->w * xratio,
-				                   .h = sub_rect->h * yratio
-				                  };
-				SDL_RenderCopy(renderer, is->sub_texture, sub_rect, &target);
-			}
-#endif
 		}
 	}
 }
@@ -1453,11 +1435,6 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts,
 {
 	Frame *vp;
 
-#if defined(DEBUG_SYNC)
-	printf("frame_type=%c pts=%0.3f\n",
-	       av_get_picture_type_char(src_frame->pict_type), pts);
-#endif
-
 	if (!(vp = frame_queue_peek_writable(&is->pictq)))
 		return -1;
 
@@ -1742,11 +1719,9 @@ static int audio_thread(void *arg)
 	VideoState *is = arg;
 	AVFrame *frame = av_frame_alloc();
 	Frame *af;
-#if CONFIG_AVFILTER
 	int last_serial = -1;
 	int64_t dec_channel_layout;
 	int reconfigure;
-#endif
 	int got_frame = 0;
 	AVRational tb;
 	int ret = 0;
@@ -2144,15 +2119,6 @@ static int audio_decode_frame(VideoState *is)
 	else
 		is->audio_clock = NAN;
 	is->audio_clock_serial = af->serial;
-#ifdef DEBUG
-	{
-		static double last_clock;
-		printf("audio: delay=%0.3f clock=%0.3f clock0=%0.3f\n",
-		       is->audio_clock - last_clock,
-		       is->audio_clock, audio_clock0);
-		last_clock = is->audio_clock;
-	}
-#endif
 	return resampled_data_size;
 }
 
@@ -2342,15 +2308,8 @@ static int stream_component_open(VideoState *is, int stream_index)
 	}
 	av_codec_set_lowres(avctx, stream_lowres);
 
-#if FF_API_EMU_EDGE
-	if (stream_lowres) avctx->flags |= CODEC_FLAG_EMU_EDGE;
-#endif
 	if (fast)
 		avctx->flags2 |= AV_CODEC_FLAG2_FAST;
-#if FF_API_EMU_EDGE
-	if (codec->capabilities & AV_CODEC_CAP_DR1)
-		avctx->flags |= CODEC_FLAG_EMU_EDGE;
-#endif
 
 	opts = filter_codec_opts(codec_opts, avctx->codec_id, ic,
 	                         ic->streams[stream_index], codec);
