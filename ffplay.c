@@ -60,8 +60,6 @@ const int program_birth_year = 2003;
 
 #define MAX_QUEUE_SIZE (15 * 1024 * 1024)
 #define MIN_FRAMES 25
-#define EXTERNAL_CLOCK_MIN_FRAMES 2
-#define EXTERNAL_CLOCK_MAX_FRAMES 10
 
 /* Minimum SDL audio buffer size, in samples. */
 #define SDL_AUDIO_MIN_BUFFER_SIZE 512
@@ -83,11 +81,6 @@ const int program_birth_year = 2003;
 /* maximum audio speed change to get correct sync */
 #define SAMPLE_CORRECTION_PERCENT_MAX 10
 
-/* external clock speed adjustment constants for realtime sources based on buffer fullness */
-#define EXTERNAL_CLOCK_SPEED_MIN  0.900
-#define EXTERNAL_CLOCK_SPEED_MAX  1.010
-#define EXTERNAL_CLOCK_SPEED_STEP 0.001
-
 /* we use about AUDIO_DIFF_AVG_NB A-V differences to make the average */
 #define AUDIO_DIFF_AVG_NB   20
 
@@ -97,8 +90,6 @@ const int program_birth_year = 2003;
 /* NOTE: the size must be big enough to compensate the hardware audio buffersize size */
 /* TODO: We assume that a decoded and resampled frame fits into this buffer */
 #define SAMPLE_ARRAY_SIZE (8 * 65536)
-
-#define CURSOR_HIDE_DELAY 1000000
 
 static unsigned sws_flags = SWS_BICUBIC;
 
@@ -175,8 +166,6 @@ typedef struct FrameQueue {
 
 enum {
 	AV_SYNC_AUDIO_MASTER, /* default choice */
-	AV_SYNC_VIDEO_MASTER,
-	AV_SYNC_EXTERNAL_CLOCK, /* synchronize to an external clock */
 };
 
 typedef struct Decoder {
@@ -277,7 +266,7 @@ typedef struct VideoState {
 	int eof;
 
 	char *filename;
-	int width, height, xleft, ytop;
+	int width, height;
 
 	int vfilter_idx;
 	AVFilterContext *in_video_filter;   // the first filter in the video chain
@@ -299,7 +288,6 @@ static int default_width = 640;
 static int default_height = 480;
 static int screen_width = 0;
 static int screen_height = 0;
-static int subtitle_disable;
 static const char *wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 static int seek_by_bytes = -1;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
@@ -738,9 +726,8 @@ static int realloc_texture(SDL_Texture **texture, Uint32 new_format,
 	return 0;
 }
 
-static void calculate_display_rect(SDL_Rect *rect,
-                                   int scr_xleft, int scr_ytop, int scr_width, int scr_height,
-                                   int pic_width, int pic_height, AVRational pic_sar)
+static void calculate_display_rect(SDL_Rect *rect, int scr_width,
+                                   int scr_height, int pic_width, int pic_height, AVRational pic_sar)
 {
 	float aspect_ratio;
 	int width, height, x, y;
@@ -763,8 +750,8 @@ static void calculate_display_rect(SDL_Rect *rect,
 	}
 	x = (scr_width - width) / 2;
 	y = (scr_height - height) / 2;
-	rect->x = scr_xleft + x;
-	rect->y = scr_ytop  + y;
+	rect->x = x;
+	rect->y = y;
 	rect->w = FFMAX(width,  1);
 	rect->h = FFMAX(height, 1);
 }
@@ -861,8 +848,8 @@ static void video_image_display(VideoState *is)
 			}
 		}
 
-		calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height,
-		                       vp->width, vp->height, vp->sar);
+		calculate_display_rect(&rect, is->width, is->height, vp->width, vp->height,
+		                       vp->sar);
 
 		if (!vp->uploaded) {
 			if (upload_texture(vp->bmp, vp->frame, &is->img_convert_ctx) < 0)
@@ -875,11 +862,6 @@ static void video_image_display(VideoState *is)
 			SDL_RenderCopy(renderer, is->sub_texture, NULL, &rect);
 		}
 	}
-}
-
-static inline int compute_mod(int a, int b)
-{
-	return a < 0 ? a % b + b : a % b;
 }
 
 static void do_exit(VideoState *is)
@@ -896,7 +878,7 @@ static void sigterm_handler(int sig)
 static void set_default_window_size(int width, int height, AVRational sar)
 {
 	SDL_Rect rect;
-	calculate_display_rect(&rect, 0, 0, INT_MAX, height, width, height, sar);
+	calculate_display_rect(&rect, INT_MAX, height, width, height, sar);
 	default_width = rect.w;
 	default_height = rect.h;
 }
@@ -1002,40 +984,10 @@ static void sync_clock_to_slave(Clock *c, Clock *slave)
 		set_clock(c, slave_clock, slave->serial);
 }
 
-static int get_master_sync_type(VideoState *is)
-{
-	if (is->av_sync_type == AV_SYNC_VIDEO_MASTER) {
-		if (is->video_st)
-			return AV_SYNC_VIDEO_MASTER;
-		else
-			return AV_SYNC_AUDIO_MASTER;
-	} else if (is->av_sync_type == AV_SYNC_AUDIO_MASTER) {
-		if (is->audio_st)
-			return AV_SYNC_AUDIO_MASTER;
-		else
-			return AV_SYNC_EXTERNAL_CLOCK;
-	} else {
-		return AV_SYNC_EXTERNAL_CLOCK;
-	}
-}
-
 /* get the current master clock value */
 static double get_master_clock(VideoState *is)
 {
-	double val;
-
-	switch (get_master_sync_type(is)) {
-	case AV_SYNC_VIDEO_MASTER:
-		val = get_clock(&is->vidclk);
-		break;
-	case AV_SYNC_AUDIO_MASTER:
-		val = get_clock(&is->audclk);
-		break;
-	default:
-		val = get_clock(&is->extclk);
-		break;
-	}
-	return val;
+	return get_clock(&is->audclk);
 }
 
 /* seek in the stream */
@@ -1063,29 +1015,25 @@ static double compute_target_delay(double delay, VideoState *is)
 {
 	double sync_threshold, diff = 0;
 
-	/* update delay to follow master synchronisation source */
-	if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
-		/* if video is slave, we try to correct big delays by
-		   duplicating or deleting a frame */
-		diff = get_clock(&is->vidclk) - get_master_clock(is);
+	/* if video is slave, we try to correct big delays by
+	   duplicating or deleting a frame */
+	diff = get_clock(&is->vidclk) - get_master_clock(is);
 
-		/* skip or repeat frame. We take into account the
-		   delay to compute the threshold. I still don't know
-		   if it is the best guess */
-		sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX,
-		                       delay));
-		if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
-			if (diff <= -sync_threshold)
-				delay = FFMAX(0, delay + diff);
-			else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
-				delay = delay + diff;
-			else if (diff >= sync_threshold)
-				delay = 2 * delay;
-		}
+	/* skip or repeat frame. We take into account the
+	   delay to compute the threshold. I still don't know
+	   if it is the best guess */
+	sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX,
+	                       delay));
+	if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
+		if (diff <= -sync_threshold)
+			delay = FFMAX(0, delay + diff);
+		else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
+			delay = delay + diff;
+		else if (diff >= sync_threshold)
+			delay = 2 * delay;
 	}
 
-	av_log(NULL, AV_LOG_TRACE, "video: delay=%0.3f A-V=%f\n",
-	       delay, -diff);
+	av_log(NULL, AV_LOG_TRACE, "video: delay=%0.3f A-V=%f\n", delay, -diff);
 
 	return delay;
 }
@@ -1170,9 +1118,7 @@ retry:
 			if (frame_queue_nb_remaining(&is->pictq) > 1) {
 				Frame *nextvp = frame_queue_peek_next(&is->pictq);
 				duration = vp_duration(is, vp, nextvp);
-				if ((framedrop > 0 || (framedrop &&
-				                       get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) &&
-				    time > is->frame_timer + duration) {
+				if ((framedrop > 0 || framedrop) && time > is->frame_timer + duration) {
 					is->frame_drops_late++;
 					frame_queue_next(&is->pictq);
 					goto retry;
@@ -1335,8 +1281,7 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
 		frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st,
 		                             frame);
 
-		if (framedrop > 0 || (framedrop &&
-		                      get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
+		if (framedrop > 0 || framedrop) {
 			if (frame->pts != AV_NOPTS_VALUE) {
 				double diff = dpts - get_master_clock(is);
 				if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD &&
@@ -1801,43 +1746,7 @@ static void update_sample_display(VideoState *is, short *samples,
  * or external master clock */
 static int synchronize_audio(VideoState *is, int nb_samples)
 {
-	int wanted_nb_samples = nb_samples;
-
-	/* if not master, then we try to remove or add samples to correct the clock */
-	if (get_master_sync_type(is) != AV_SYNC_AUDIO_MASTER) {
-		double diff, avg_diff;
-		int min_nb_samples, max_nb_samples;
-
-		diff = get_clock(&is->audclk) - get_master_clock(is);
-
-		if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD) {
-			is->audio_diff_cum = diff + is->audio_diff_avg_coef * is->audio_diff_cum;
-			if (is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
-				/* not enough measures to have a correct estimate */
-				is->audio_diff_avg_count++;
-			} else {
-				/* estimate the A-V difference */
-				avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
-
-				if (fabs(avg_diff) >= is->audio_diff_threshold) {
-					wanted_nb_samples = nb_samples + (int)(diff * is->audio_src.freq);
-					min_nb_samples = ((nb_samples * (100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100));
-					max_nb_samples = ((nb_samples * (100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100));
-					wanted_nb_samples = av_clip(wanted_nb_samples, min_nb_samples, max_nb_samples);
-				}
-				av_log(NULL, AV_LOG_TRACE, "diff=%f adiff=%f sample_diff=%d apts=%0.3f %f\n",
-				       diff, avg_diff, wanted_nb_samples - nb_samples,
-				       is->audio_clock, is->audio_diff_threshold);
-			}
-		} else {
-			/* too big difference : may be initial PTS errors, so
-			   reset A-V filter */
-			is->audio_diff_avg_count = 0;
-			is->audio_diff_cum = 0;
-		}
-	}
-
-	return wanted_nb_samples;
+	return nb_samples;
 }
 
 /**
@@ -2112,13 +2021,16 @@ static int stream_component_open(VideoState *is, int stream_index)
 	switch (avctx->codec_type) {
 	case AVMEDIA_TYPE_AUDIO:
 		is->last_audio_stream = stream_index;
-		forced_codec_name = audio_codec_name; break;
+		forced_codec_name = audio_codec_name;
+		break;
 	case AVMEDIA_TYPE_SUBTITLE:
 		is->last_subtitle_stream = stream_index;
-		forced_codec_name = subtitle_codec_name; break;
+		forced_codec_name = subtitle_codec_name;
+		break;
 	case AVMEDIA_TYPE_VIDEO :
 		is->last_video_stream = stream_index;
-		forced_codec_name = video_codec_name; break;
+		forced_codec_name = video_codec_name;
+		break;
 	default:
 		break;
 	}
@@ -2384,17 +2296,12 @@ static int read_thread(void *arg)
 
 	st_index[AVMEDIA_TYPE_VIDEO] = av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO,
 	                               st_index[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
-	st_index[AVMEDIA_TYPE_AUDIO] =
-	    av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, st_index[AVMEDIA_TYPE_AUDIO],
-	                        st_index[AVMEDIA_TYPE_VIDEO], NULL, 0);
-	if (!subtitle_disable)
-		st_index[AVMEDIA_TYPE_SUBTITLE] =
-		    av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
-		                        st_index[AVMEDIA_TYPE_SUBTITLE],
-		                        (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ?
-		                         st_index[AVMEDIA_TYPE_AUDIO] :
-		                         st_index[AVMEDIA_TYPE_VIDEO]),
-		                        NULL, 0);
+	st_index[AVMEDIA_TYPE_AUDIO] = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO,
+	                               st_index[AVMEDIA_TYPE_AUDIO], st_index[AVMEDIA_TYPE_VIDEO], NULL, 0);
+	st_index[AVMEDIA_TYPE_SUBTITLE] = av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
+	                                  st_index[AVMEDIA_TYPE_SUBTITLE],
+	                                  (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ? st_index[AVMEDIA_TYPE_AUDIO] :
+	                                   st_index[AVMEDIA_TYPE_VIDEO]), NULL, 0);
 
 	is->show_mode = show_mode;
 	if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
@@ -2572,8 +2479,6 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 	if (!is->filename)
 		goto fail;
 	is->iformat = iformat;
-	is->ytop = 0;
-	is->xleft = 0;
 
 	/* start video display */
 	if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
