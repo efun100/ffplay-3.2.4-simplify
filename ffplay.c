@@ -53,8 +53,6 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
 
-#include "cmdutils.h"
-
 const char program_name[] = "ffplay";
 const int program_birth_year = 2003;
 
@@ -164,10 +162,6 @@ typedef struct FrameQueue {
 	PacketQueue *pktq;
 } FrameQueue;
 
-enum {
-	AV_SYNC_AUDIO_MASTER, /* default choice */
-};
-
 typedef struct Decoder {
 	AVPacket pkt;
 	AVPacket pkt_temp;
@@ -210,8 +204,6 @@ typedef struct VideoState {
 	Decoder subdec;
 
 	int audio_stream;
-
-	int av_sync_type;
 
 	double audio_clock;
 	int audio_clock_serial;
@@ -290,7 +282,6 @@ static int screen_width = 0;
 static int screen_height = 0;
 static const char *wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 static int seek_by_bytes = -1;
-static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
 static int64_t duration = AV_NOPTS_VALUE;
 static int fast = 0;
@@ -319,6 +310,62 @@ static AVPacket flush_pkt;
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
+
+AVDictionary *sws_dict;
+AVDictionary *swr_opts;
+AVDictionary *format_opts, *codec_opts;
+
+void init_opts(void)
+{
+	av_dict_set(&sws_dict, "flags", "bicubic", 0);
+}
+
+static void (*program_exit)(int ret);
+
+void exit_program(int ret)
+{
+	if (program_exit)
+		program_exit(ret);
+
+	exit(ret);
+}
+
+void print_error(const char *filename, int err)
+{
+	char errbuf[128];
+	const char *errbuf_ptr = errbuf;
+
+	if (av_strerror(err, errbuf, sizeof(errbuf)) < 0)
+		errbuf_ptr = strerror(AVUNERROR(err));
+	av_log(NULL, AV_LOG_ERROR, "%s: %s\n", filename, errbuf_ptr);
+}
+
+int check_stream_specifier(AVFormatContext *s, AVStream *st, const char *spec)
+{
+	int ret = avformat_match_stream_specifier(s, st, spec);
+	if (ret < 0)
+		av_log(s, AV_LOG_ERROR, "Invalid stream specifier: %s.\n", spec);
+	return ret;
+}
+
+AVDictionary **setup_find_stream_info_opts(AVFormatContext *s,
+        AVDictionary *codec_opts)
+{
+	int i;
+	AVDictionary **opts;
+
+	if (!s->nb_streams)
+		return NULL;
+	opts = av_mallocz_array(s->nb_streams, sizeof(*opts));
+	if (!opts) {
+		av_log(NULL, AV_LOG_ERROR,
+		       "Could not alloc memory for stream options.\n");
+		return NULL;
+	}
+	for (i = 0; i < s->nb_streams; i++)
+		opts[i] = NULL;
+	return opts;
+}
 
 static inline
 int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
@@ -1742,13 +1789,6 @@ static void update_sample_display(VideoState *is, short *samples,
 	}
 }
 
-/* return the wanted number of samples to get better sync if sync_type is video
- * or external master clock */
-static int synchronize_audio(VideoState *is, int nb_samples)
-{
-	return nb_samples;
-}
-
 /**
  * Decode one audio frame and return its uncompressed size.
  *
@@ -1780,7 +1820,7 @@ static int audio_decode_frame(VideoState *is)
 	         af->frame->channel_layout)) ?
 	    af->frame->channel_layout : av_get_default_channel_layout(av_frame_get_channels(
 	                af->frame));
-	wanted_nb_samples = synchronize_audio(is, af->frame->nb_samples);
+	wanted_nb_samples = af->frame->nb_samples;
 
 	if (af->frame->format != is->audio_src.fmt ||
 	    dec_channel_layout != is->audio_src.channel_layout ||
@@ -2059,8 +2099,7 @@ static int stream_component_open(VideoState *is, int stream_index)
 	if (fast)
 		avctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
-	opts = filter_codec_opts(codec_opts, avctx->codec_id, ic,
-	                         ic->streams[stream_index], codec);
+	opts = NULL;
 	if (!av_dict_get(opts, "threads", NULL, 0))
 		av_dict_set(&opts, "threads", "auto", 0);
 	if (stream_lowres)
@@ -2503,7 +2542,6 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 	init_clock(&is->extclk, &is->extclk.serial);
 	is->audio_clock_serial = -1;
 	is->audio_volume = SDL_MIX_MAXVOLUME;
-	is->av_sync_type = av_sync_type;
 	is->read_tid = SDL_CreateThread(read_thread, "read_thread", is);
 	if (!is->read_tid) {
 		av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
