@@ -54,7 +54,6 @@
 #include <SDL2/SDL_thread.h>
 
 const char program_name[] = "ffplay";
-const int program_birth_year = 2003;
 
 #define MAX_QUEUE_SIZE (15 * 1024 * 1024)
 #define MIN_FRAMES 25
@@ -320,16 +319,6 @@ void init_opts(void)
 	av_dict_set(&sws_dict, "flags", "bicubic", 0);
 }
 
-static void (*program_exit)(int ret);
-
-void exit_program(int ret)
-{
-	if (program_exit)
-		program_exit(ret);
-
-	exit(ret);
-}
-
 void print_error(const char *filename, int err)
 {
 	char errbuf[128];
@@ -338,14 +327,6 @@ void print_error(const char *filename, int err)
 	if (av_strerror(err, errbuf, sizeof(errbuf)) < 0)
 		errbuf_ptr = strerror(AVUNERROR(err));
 	av_log(NULL, AV_LOG_ERROR, "%s: %s\n", filename, errbuf_ptr);
-}
-
-int check_stream_specifier(AVFormatContext *s, AVStream *st, const char *spec)
-{
-	int ret = avformat_match_stream_specifier(s, st, spec);
-	if (ret < 0)
-		av_log(s, AV_LOG_ERROR, "Invalid stream specifier: %s.\n", spec);
-	return ret;
 }
 
 AVDictionary **setup_find_stream_info_opts(AVFormatContext *s,
@@ -915,11 +896,6 @@ static void do_exit(VideoState *is)
 {
 	av_log(NULL, AV_LOG_QUIET, "%s", "");
 	exit(0);
-}
-
-static void sigterm_handler(int sig)
-{
-	exit(123);
 }
 
 static void set_default_window_size(int width, int height, AVRational sar)
@@ -2527,8 +2503,7 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 	if (frame_queue_init(&is->sampq, &is->audioq, SAMPLE_QUEUE_SIZE, 1) < 0)
 		goto fail;
 
-	if (packet_queue_init(&is->videoq) < 0 ||
-	    packet_queue_init(&is->audioq) < 0 ||
+	if (packet_queue_init(&is->videoq) < 0 || packet_queue_init(&is->audioq) < 0 ||
 	    packet_queue_init(&is->subtitleq) < 0)
 		goto fail;
 
@@ -2645,27 +2620,6 @@ do_seek:
 	}
 }
 
-static int lockmgr(void **mtx, enum AVLockOp op)
-{
-	switch (op) {
-	case AV_LOCK_CREATE:
-		*mtx = SDL_CreateMutex();
-		if (!*mtx) {
-			av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
-			return 1;
-		}
-		return 0;
-	case AV_LOCK_OBTAIN:
-		return !!SDL_LockMutex(*mtx);
-	case AV_LOCK_RELEASE:
-		return !!SDL_UnlockMutex(*mtx);
-	case AV_LOCK_DESTROY:
-		SDL_DestroyMutex(*mtx);
-		return 0;
-	}
-	return 1;
-}
-
 /* Called from the main */
 int main(int argc, char **argv)
 {
@@ -2682,9 +2636,6 @@ int main(int argc, char **argv)
 	avformat_network_init();
 
 	init_opts();
-
-	signal(SIGINT , sigterm_handler); /* Interrupt (ANSI).    */
-	signal(SIGTERM, sigterm_handler); /* Termination (ANSI).  */
 
 	if (argc < 2) {
 		av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
@@ -2711,11 +2662,6 @@ int main(int argc, char **argv)
 
 	SDL_EventState(SDL_SYSWMEVENT, SDL_IGNORE);
 	SDL_EventState(SDL_USEREVENT, SDL_IGNORE);
-
-	if (av_lockmgr_register(lockmgr)) {
-		av_log(NULL, AV_LOG_FATAL, "Could not initialize lock manager!\n");
-		do_exit(NULL);
-	}
 
 	av_init_packet(&flush_pkt);
 	flush_pkt.data = (uint8_t *)&flush_pkt;
