@@ -280,11 +280,9 @@ static int default_height = 480;
 static int screen_width = 0;
 static int screen_height = 0;
 static const char *wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
-static int seek_by_bytes = -1;
 static int64_t start_time = AV_NOPTS_VALUE;
 static int64_t duration = AV_NOPTS_VALUE;
 static int fast = 0;
-static int genpts = 0;
 static int lowres = 0;
 static int decoder_reorder_pts = -1;
 static int autoexit;
@@ -2200,7 +2198,6 @@ static int read_thread(void *arg)
 	AVDictionary **opts;
 	int orig_nb_streams;
 	SDL_mutex *wait_mutex = SDL_CreateMutex();
-	int scan_all_pmts_set = 0;
 	int64_t pkt_ts;
 
 	if (!wait_mutex) {
@@ -2223,30 +2220,19 @@ static int read_thread(void *arg)
 	}
 	ic->interrupt_callback.callback = decode_interrupt_cb;
 	ic->interrupt_callback.opaque = is;
-	if (!av_dict_get(format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE)) {
-		av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
-		scan_all_pmts_set = 1;
-	}
+
+	av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
+
 	err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
 	if (err < 0) {
 		print_error(is->filename, err);
 		ret = -1;
 		goto fail;
 	}
-	if (scan_all_pmts_set)
-		av_dict_set(&format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
 
-	if ((t = av_dict_get(format_opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
-		av_log(NULL, AV_LOG_ERROR, "Option %s not found.\n", t->key);
-		ret = AVERROR_OPTION_NOT_FOUND;
-		goto fail;
-	}
 	is->ic = ic;
 
-	if (genpts)
-		ic->flags |= AVFMT_FLAG_GENPTS;
-
-	av_format_inject_global_side_data(ic);
+	ic->flags |= AVFMT_FLAG_GENPTS;
 
 	opts = setup_find_stream_info_opts(ic, codec_opts);
 	orig_nb_streams = ic->nb_streams;
@@ -2267,10 +2253,6 @@ static int read_thread(void *arg)
 	if (ic->pb)
 		// FIXME hack, ffplay maybe should not use avio_feof() to test for the end
 		ic->pb->eof_reached = 0;
-
-	if (seek_by_bytes < 0)
-		seek_by_bytes = !!(ic->iformat->flags & AVFMT_TS_DISCONT) &&
-		                strcmp("ogg", ic->iformat->name);
 
 	is->max_frame_duration = (ic->iformat->flags & AVFMT_TS_DISCONT) ? 10.0 :
 	                         3600.0;
@@ -2564,32 +2546,15 @@ static void event_loop(VideoState *cur_stream)
 				incr = 10.0;
 				goto do_seek;
 do_seek:
-				if (seek_by_bytes) {
-					pos = -1;
-					if (pos < 0 && cur_stream->video_stream >= 0)
-						pos = frame_queue_last_pos(&cur_stream->pictq);
-					if (pos < 0 && cur_stream->audio_stream >= 0)
-						pos = frame_queue_last_pos(&cur_stream->sampq);
-					if (pos < 0)
-						pos = avio_tell(cur_stream->ic->pb);
-					if (cur_stream->ic->bit_rate)
-						incr *= cur_stream->ic->bit_rate / 8.0;
-					else
-						incr *= 180000.0;
-					pos += incr;
-					stream_seek(cur_stream, pos, incr, 1);
-				} else {
-					pos = get_master_clock(cur_stream);
-					if (isnan(pos))
-						pos = (double)cur_stream->seek_pos / AV_TIME_BASE;
-					pos += incr;
-					if (cur_stream->ic->start_time != AV_NOPTS_VALUE &&
-					    pos < cur_stream->ic->start_time / (double)AV_TIME_BASE)
-						pos = cur_stream->ic->start_time / (double)AV_TIME_BASE;
-					stream_seek(cur_stream, (int64_t)(pos * AV_TIME_BASE),
-					            (int64_t)(incr * AV_TIME_BASE), 0);
-				}
-				break;
+				pos = get_master_clock(cur_stream);
+				if (isnan(pos))
+					pos = (double)cur_stream->seek_pos / AV_TIME_BASE;
+				pos += incr;
+				if (cur_stream->ic->start_time != AV_NOPTS_VALUE &&
+				    pos < cur_stream->ic->start_time / (double)AV_TIME_BASE)
+					pos = cur_stream->ic->start_time / (double)AV_TIME_BASE;
+				stream_seek(cur_stream, (int64_t)(pos * AV_TIME_BASE),
+				            (int64_t)(incr * AV_TIME_BASE), 0);
 			default:
 				break;
 			}
