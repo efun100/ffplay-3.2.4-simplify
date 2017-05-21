@@ -279,7 +279,6 @@ static int default_width = 640;
 static int default_height = 480;
 static int screen_width = 0;
 static int screen_height = 0;
-static const char *wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 static int64_t start_time = AV_NOPTS_VALUE;
 static int64_t duration = AV_NOPTS_VALUE;
 static int fast = 0;
@@ -330,7 +329,6 @@ void print_error(const char *filename, int err)
 AVDictionary **setup_find_stream_info_opts(AVFormatContext *s,
         AVDictionary *codec_opts)
 {
-	int i;
 	AVDictionary **opts;
 
 	if (!s->nb_streams)
@@ -341,8 +339,7 @@ AVDictionary **setup_find_stream_info_opts(AVFormatContext *s,
 		       "Could not alloc memory for stream options.\n");
 		return NULL;
 	}
-	for (i = 0; i < s->nb_streams; i++)
-		opts[i] = NULL;
+	memset(opts, 0, s->nb_streams * sizeof(*opts));
 	return opts;
 }
 
@@ -706,16 +703,6 @@ static int frame_queue_nb_remaining(FrameQueue *f)
 	return f->size - f->rindex_shown;
 }
 
-/* return last shown position */
-static int64_t frame_queue_last_pos(FrameQueue *f)
-{
-	Frame *fp = &f->queue[f->rindex];
-	if (f->rindex_shown && fp->serial == f->pktq->serial)
-		return fp->pos;
-	else
-		return -1;
-}
-
 static inline void fill_rectangle(int x, int y, int w, int h)
 {
 	SDL_Rect rect;
@@ -753,33 +740,12 @@ static int realloc_texture(SDL_Texture **texture, Uint32 new_format,
 }
 
 static void calculate_display_rect(SDL_Rect *rect, int scr_width,
-                                   int scr_height, int pic_width, int pic_height, AVRational pic_sar)
+                                   int scr_height)
 {
-	float aspect_ratio;
-	int width, height, x, y;
-
-	if (pic_sar.num == 0)
-		aspect_ratio = 0;
-	else
-		aspect_ratio = av_q2d(pic_sar);
-
-	if (aspect_ratio <= 0.0)
-		aspect_ratio = 1.0;
-	aspect_ratio *= (float)pic_width / (float)pic_height;
-
-	/* XXX: we suppose the screen has a 1.0 pixel ratio */
-	height = scr_height;
-	width = lrint(height * aspect_ratio) & ~1;
-	if (width > scr_width) {
-		width = scr_width;
-		height = lrint(width / aspect_ratio) & ~1;
-	}
-	x = (scr_width - width) / 2;
-	y = (scr_height - height) / 2;
-	rect->x = x;
-	rect->y = y;
-	rect->w = FFMAX(width,  1);
-	rect->h = FFMAX(height, 1);
+	rect->x = 0;
+	rect->y = 0;
+	rect->w = FFMAX(scr_width,  1);
+	rect->h = FFMAX(scr_height, 1);
 }
 
 static int upload_texture(SDL_Texture *tex, AVFrame *frame,
@@ -874,8 +840,7 @@ static void video_image_display(VideoState *is)
 			}
 		}
 
-		calculate_display_rect(&rect, is->width, is->height, vp->width, vp->height,
-		                       vp->sar);
+		calculate_display_rect(&rect, is->width, is->height);
 
 		if (!vp->uploaded) {
 			if (upload_texture(vp->bmp, vp->frame, &is->img_convert_ctx) < 0)
@@ -896,10 +861,10 @@ static void do_exit(VideoState *is)
 	exit(0);
 }
 
-static void set_default_window_size(int width, int height, AVRational sar)
+static void set_default_window_size(int width, int height)
 {
 	SDL_Rect rect;
-	calculate_display_rect(&rect, INT_MAX, height, width, height, sar);
+	calculate_display_rect(&rect, width, height);
 	default_width = rect.w;
 	default_height = rect.h;
 }
@@ -909,7 +874,7 @@ static int video_open(VideoState *is, Frame *vp)
 	int w, h;
 
 	if (vp && vp->width)
-		set_default_window_size(vp->width, vp->height, vp->sar);
+		set_default_window_size(vp->width, vp->height);
 
 	if (screen_width) {
 		w = screen_width;
@@ -2240,7 +2205,7 @@ static int read_thread(void *arg)
 	err = avformat_find_stream_info(ic, opts);
 
 	for (i = 0; i < orig_nb_streams; i++)
-		av_dict_free(&opts[i]);
+		av_dict_free(opts + i);
 	av_freep(&opts);
 
 	if (err < 0) {
@@ -2254,42 +2219,10 @@ static int read_thread(void *arg)
 		// FIXME hack, ffplay maybe should not use avio_feof() to test for the end
 		ic->pb->eof_reached = 0;
 
-	is->max_frame_duration = (ic->iformat->flags & AVFMT_TS_DISCONT) ? 10.0 :
-	                         3600.0;
+	is->max_frame_duration = 3600.0;
 
 	if (!window_title && (t = av_dict_get(ic->metadata, "title", NULL, 0)))
 		window_title = av_asprintf("%s - %s", t->value, input_filename);
-
-	/* if seeking requested, we execute it */
-	if (start_time != AV_NOPTS_VALUE) {
-		int64_t timestamp;
-
-		timestamp = start_time;
-		/* add the stream start time */
-		if (ic->start_time != AV_NOPTS_VALUE)
-			timestamp += ic->start_time;
-		ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
-		if (ret < 0) {
-			av_log(NULL, AV_LOG_WARNING, "%s: could not seek to position %0.3f\n",
-			       is->filename, (double)timestamp / AV_TIME_BASE);
-		}
-	}
-
-	for (i = 0; i < ic->nb_streams; i++) {
-		AVStream *st = ic->streams[i];
-		enum AVMediaType type = st->codecpar->codec_type;
-		st->discard = AVDISCARD_ALL;
-		if (type >= 0 && wanted_stream_spec[type] && st_index[type] == -1)
-			if (avformat_match_stream_specifier(ic, st, wanted_stream_spec[type]) > 0)
-				st_index[type] = i;
-	}
-	for (i = 0; i < AVMEDIA_TYPE_NB; i++) {
-		if (wanted_stream_spec[i] && st_index[i] == -1) {
-			av_log(NULL, AV_LOG_ERROR, "Stream specifier %s does not match any %s stream\n",
-			       wanted_stream_spec[i], av_get_media_type_string(i));
-			st_index[i] = INT_MAX;
-		}
-	}
 
 	st_index[AVMEDIA_TYPE_VIDEO] = av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO,
 	                               st_index[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
@@ -2302,11 +2235,10 @@ static int read_thread(void *arg)
 
 	is->show_mode = show_mode;
 	if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
-		AVStream *st = ic->streams[st_index[AVMEDIA_TYPE_VIDEO]];
-		AVCodecParameters *codecpar = st->codecpar;
-		AVRational sar = av_guess_sample_aspect_ratio(ic, st, NULL);
+		AVCodecParameters *codecpar =
+		    ic->streams[st_index[AVMEDIA_TYPE_VIDEO]]->codecpar;
 		if (codecpar->width)
-			set_default_window_size(codecpar->width, codecpar->height, sar);
+			set_default_window_size(codecpar->width, codecpar->height);
 	}
 
 	/* open the streams */
