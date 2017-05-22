@@ -108,9 +108,8 @@ typedef struct PacketQueue {
 } PacketQueue;
 
 #define VIDEO_PICTURE_QUEUE_SIZE 3
-#define SUBPICTURE_QUEUE_SIZE 16
 #define SAMPLE_QUEUE_SIZE 9
-#define FRAME_QUEUE_SIZE FFMAX(SAMPLE_QUEUE_SIZE, FFMAX(VIDEO_PICTURE_QUEUE_SIZE, SUBPICTURE_QUEUE_SIZE))
+#define FRAME_QUEUE_SIZE FFMAX(SAMPLE_QUEUE_SIZE, VIDEO_PICTURE_QUEUE_SIZE)
 
 typedef struct AudioParams {
 	int freq;
@@ -134,7 +133,6 @@ typedef struct Clock {
 /* Common struct for handling all types of decoded data and allocated render buffers. */
 typedef struct Frame {
 	AVFrame *frame;
-	AVSubtitle sub;
 	int serial;
 	double pts;           /* presentation timestamp for the frame */
 	double duration;      /* estimated duration of the frame */
@@ -195,12 +193,10 @@ typedef struct VideoState {
 	Clock extclk;
 
 	FrameQueue pictq;
-	FrameQueue subpq;
 	FrameQueue sampq;
 
 	Decoder auddec;
 	Decoder viddec;
-	Decoder subdec;
 
 	int audio_stream;
 
@@ -236,10 +232,6 @@ typedef struct VideoState {
 	double last_vis_time;
 	SDL_Texture *vis_texture;
 	SDL_Texture *sub_texture;
-
-	int subtitle_stream;
-	AVStream *subtitle_st;
-	PacketQueue subtitleq;
 
 	double frame_timer;
 	double frame_last_returned_time;
@@ -500,7 +492,7 @@ static void decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue,
 	d->start_pts = AV_NOPTS_VALUE;
 }
 
-static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub)
+static int decoder_decode_frame(Decoder *d, AVFrame *frame)
 {
 	int got_frame = 0;
 	AVPacket pkt;
@@ -556,9 +548,6 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub)
 				}
 			}
 			break;
-		case AVMEDIA_TYPE_SUBTITLE:
-			ret = avcodec_decode_subtitle2(d->avctx, sub, &got_frame, &d->pkt_temp);
-			break;
 		default:
 			break;
 		}
@@ -589,7 +578,6 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub)
 static void frame_queue_unref_item(Frame *vp)
 {
 	av_frame_unref(vp->frame);
-	avsubtitle_free(&vp->sub);
 }
 
 static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size,
@@ -781,54 +769,6 @@ static void video_image_display(VideoState *is)
 
 	vp = frame_queue_peek_last(&is->pictq);
 	if (vp->bmp) {
-		if (is->subtitle_st) {
-			if (frame_queue_nb_remaining(&is->subpq) > 0) {
-				sp = frame_queue_peek(&is->subpq);
-
-				if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
-					if (!sp->uploaded) {
-						uint8_t *pixels[4];
-						int pitch[4];
-						int i;
-						if (!sp->width || !sp->height) {
-							sp->width = vp->width;
-							sp->height = vp->height;
-						}
-						if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width,
-						                    sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
-							return;
-
-						for (i = 0; i < sp->sub.num_rects; i++) {
-							AVSubtitleRect *sub_rect = sp->sub.rects[i];
-
-							sub_rect->x = av_clip(sub_rect->x, 0, sp->width);
-							sub_rect->y = av_clip(sub_rect->y, 0, sp->height);
-							sub_rect->w = av_clip(sub_rect->w, 0, sp->width  - sub_rect->x);
-							sub_rect->h = av_clip(sub_rect->h, 0, sp->height - sub_rect->y);
-
-							is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx,
-							                      sub_rect->w, sub_rect->h, AV_PIX_FMT_PAL8,
-							                      sub_rect->w, sub_rect->h, AV_PIX_FMT_BGRA,
-							                      0, NULL, NULL, NULL);
-							if (!is->sub_convert_ctx) {
-								av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
-								return;
-							}
-							if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)pixels,
-							                     pitch)) {
-								sws_scale(is->sub_convert_ctx, (const uint8_t *const *)sub_rect->data,
-								          sub_rect->linesize,
-								          0, sub_rect->h, pixels, pitch);
-								SDL_UnlockTexture(is->sub_texture);
-							}
-						}
-						sp->uploaded = 1;
-					}
-				} else
-					sp = NULL;
-			}
-		}
-
 		calculate_display_rect(&rect, is->width, is->height);
 
 		if (!vp->uploaded) {
@@ -1038,8 +978,6 @@ static void video_refresh(void *opaque, double *remaining_time)
 	VideoState *is = opaque;
 	double time;
 
-	Frame *sp, *sp2;
-
 	if (is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
 		time = av_gettime_relative() / 1000000.0;
 		if (is->force_refresh || is->last_vis_time + rdftspeed < time) {
@@ -1095,41 +1033,6 @@ retry:
 					is->frame_drops_late++;
 					frame_queue_next(&is->pictq);
 					goto retry;
-				}
-			}
-
-			if (is->subtitle_st) {
-				while (frame_queue_nb_remaining(&is->subpq) > 0) {
-					sp = frame_queue_peek(&is->subpq);
-
-					if (frame_queue_nb_remaining(&is->subpq) > 1)
-						sp2 = frame_queue_peek_next(&is->subpq);
-					else
-						sp2 = NULL;
-
-					if (sp->serial != is->subtitleq.serial ||
-					    (is->vidclk.pts > (sp->pts + ((float) sp->sub.end_display_time / 1000))) ||
-					    (sp2 && is->vidclk.pts > (sp2->pts + ((float) sp2->sub.start_display_time /
-					                              1000)))) {
-						if (sp->uploaded) {
-							int i;
-							for (i = 0; i < sp->sub.num_rects; i++) {
-								AVSubtitleRect *sub_rect = sp->sub.rects[i];
-								uint8_t *pixels;
-								int pitch, j;
-
-								if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)&pixels,
-								                     &pitch)) {
-									for (j = 0; j < sub_rect->h; j++, pixels += pitch)
-										memset(pixels, 0, sub_rect->w << 2);
-									SDL_UnlockTexture(is->sub_texture);
-								}
-							}
-						}
-						frame_queue_next(&is->subpq);
-					} else {
-						break;
-					}
 				}
 			}
 
@@ -1242,7 +1145,7 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
 {
 	int got_picture;
 
-	if ((got_picture = decoder_decode_frame(&is->viddec, frame, NULL)) < 0)
+	if ((got_picture = decoder_decode_frame(&is->viddec, frame)) < 0)
 		return -1;
 
 	if (got_picture) {
@@ -1476,7 +1379,7 @@ static int audio_thread(void *arg)
 		return AVERROR(ENOMEM);
 
 	do {
-		if ((got_frame = decoder_decode_frame(&is->auddec, frame, NULL)) < 0)
+		if ((got_frame = decoder_decode_frame(&is->auddec, frame)) < 0)
 			goto the_end;
 
 		if (got_frame) {
@@ -1657,40 +1560,6 @@ static int video_thread(void *arg)
 the_end:
 	avfilter_graph_free(&graph);
 	av_frame_free(&frame);
-	return 0;
-}
-
-static int subtitle_thread(void *arg)
-{
-	VideoState *is = arg;
-	Frame *sp;
-	int got_subtitle;
-	double pts;
-
-	while (1) {
-		if (!(sp = frame_queue_peek_writable(&is->subpq)))
-			return 0;
-
-		if ((got_subtitle = decoder_decode_frame(&is->subdec, NULL, &sp->sub)) < 0)
-			break;
-
-		pts = 0;
-
-		if (got_subtitle && sp->sub.format == 0) {
-			if (sp->sub.pts != AV_NOPTS_VALUE)
-				pts = sp->sub.pts / (double)AV_TIME_BASE;
-			sp->pts = pts;
-			sp->serial = is->subdec.pkt_serial;
-			sp->width = is->subdec.avctx->width;
-			sp->height = is->subdec.avctx->height;
-			sp->uploaded = 0;
-
-			/* now we can update the picture count */
-			frame_queue_push(&is->subpq);
-		} else if (got_subtitle) {
-			avsubtitle_free(&sp->sub);
-		}
-	}
 	return 0;
 }
 
@@ -2045,14 +1914,6 @@ static int stream_component_open(VideoState *is, int stream_index)
 			goto out;
 		is->queue_attachments_req = 1;
 		break;
-	case AVMEDIA_TYPE_SUBTITLE:
-		is->subtitle_stream = stream_index;
-		is->subtitle_st = ic->streams[stream_index];
-
-		decoder_init(&is->subdec, avctx, &is->subtitleq, is->continue_read_thread);
-		if ((ret = decoder_start(&is->subdec, subtitle_thread, is)) < 0)
-			goto out;
-		break;
 	default:
 		break;
 	}
@@ -2157,10 +2018,6 @@ static int read_thread(void *arg)
 	                               st_index[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
 	st_index[AVMEDIA_TYPE_AUDIO] = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO,
 	                               st_index[AVMEDIA_TYPE_AUDIO], st_index[AVMEDIA_TYPE_VIDEO], NULL, 0);
-	st_index[AVMEDIA_TYPE_SUBTITLE] = av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
-	                                  st_index[AVMEDIA_TYPE_SUBTITLE],
-	                                  (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ? st_index[AVMEDIA_TYPE_AUDIO] :
-	                                   st_index[AVMEDIA_TYPE_VIDEO]), NULL, 0);
 
 	if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
 		AVCodecParameters *codecpar =
@@ -2180,10 +2037,6 @@ static int read_thread(void *arg)
 	}
 
 	is->show_mode = ret >= 0 ? SHOW_MODE_VIDEO : SHOW_MODE_RDFT;
-
-	if (st_index[AVMEDIA_TYPE_SUBTITLE] >= 0) {
-		stream_component_open(is, st_index[AVMEDIA_TYPE_SUBTITLE]);
-	}
 
 	if (is->video_stream < 0 && is->audio_stream < 0) {
 		av_log(NULL, AV_LOG_FATAL,
@@ -2216,10 +2069,6 @@ static int read_thread(void *arg)
 					packet_queue_flush(&is->audioq);
 					packet_queue_put(&is->audioq, &flush_pkt);
 				}
-				if (is->subtitle_stream >= 0) {
-					packet_queue_flush(&is->subtitleq);
-					packet_queue_put(&is->subtitleq, &flush_pkt);
-				}
 				if (is->video_stream >= 0) {
 					packet_queue_flush(&is->videoq);
 					packet_queue_put(&is->videoq, &flush_pkt);
@@ -2247,11 +2096,9 @@ static int read_thread(void *arg)
 
 		/* if the queue are full, no need to read more */
 		if (infinite_buffer < 1 &&
-		    (is->audioq.size + is->videoq.size + is->subtitleq.size > MAX_QUEUE_SIZE ||
+		    (is->audioq.size + is->videoq.size > MAX_QUEUE_SIZE ||
 		     (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
-		      stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq) &&
-		      stream_has_enough_packets(is->subtitle_st, is->subtitle_stream,
-		                                &is->subtitleq)))) {
+		      stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq)))) {
 			/* wait 10 ms */
 			SDL_LockMutex(wait_mutex);
 			SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
@@ -2276,8 +2123,6 @@ static int read_thread(void *arg)
 					packet_queue_put_nullpacket(&is->videoq, is->video_stream);
 				if (is->audio_stream >= 0)
 					packet_queue_put_nullpacket(&is->audioq, is->audio_stream);
-				if (is->subtitle_stream >= 0)
-					packet_queue_put_nullpacket(&is->subtitleq, is->subtitle_stream);
 				is->eof = 1;
 			}
 			if (ic->pb && ic->pb->error)
@@ -2302,8 +2147,6 @@ static int read_thread(void *arg)
 		} else if (pkt->stream_index == is->video_stream && pkt_in_play_range
 		           && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
 			packet_queue_put(&is->videoq, pkt);
-		} else if (pkt->stream_index == is->subtitle_stream && pkt_in_play_range) {
-			packet_queue_put(&is->subtitleq, pkt);
 		} else {
 			av_packet_unref(pkt);
 		}
@@ -2340,13 +2183,10 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 	/* start video display */
 	if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
 		goto fail;
-	if (frame_queue_init(&is->subpq, &is->subtitleq, SUBPICTURE_QUEUE_SIZE, 0) < 0)
-		goto fail;
 	if (frame_queue_init(&is->sampq, &is->audioq, SAMPLE_QUEUE_SIZE, 1) < 0)
 		goto fail;
 
-	if (packet_queue_init(&is->videoq) < 0 || packet_queue_init(&is->audioq) < 0 ||
-	    packet_queue_init(&is->subtitleq) < 0)
+	if (packet_queue_init(&is->videoq) < 0 || packet_queue_init(&is->audioq) < 0)
 		goto fail;
 
 	if (!(is->continue_read_thread = SDL_CreateCond())) {
