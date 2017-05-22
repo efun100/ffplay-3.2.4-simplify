@@ -181,7 +181,6 @@ typedef struct VideoState {
 	int abort_request;
 	int force_refresh;
 	int queue_attachments_req;
-	int seek_req;
 	int seek_flags;
 	int64_t seek_pos;
 	int64_t seek_rel;
@@ -269,8 +268,7 @@ static int screen_height = 0;
 static int64_t start_time = AV_NOPTS_VALUE;
 static int64_t duration = AV_NOPTS_VALUE;
 static int decoder_reorder_pts = -1;
-static int autoexit;
-static int loop = 1;
+static int autoexit = 1;
 static int framedrop = -1;
 static int infinite_buffer = -1;
 double rdftspeed = 0.02;
@@ -414,24 +412,6 @@ static int packet_queue_init(PacketQueue *q)
 	}
 	q->abort_request = 1;
 	return 0;
-}
-
-static void packet_queue_flush(PacketQueue *q)
-{
-	MyAVPacketList *pkt, *pkt1;
-
-	SDL_LockMutex(q->mutex);
-	for (pkt = q->first_pkt; pkt; pkt = pkt1) {
-		pkt1 = pkt->next;
-		av_packet_unref(&pkt->pkt);
-		av_freep(&pkt);
-	}
-	q->last_pkt = NULL;
-	q->first_pkt = NULL;
-	q->nb_packets = 0;
-	q->size = 0;
-	q->duration = 0;
-	SDL_UnlockMutex(q->mutex);
 }
 
 static void packet_queue_start(PacketQueue *q)
@@ -903,21 +883,6 @@ static double get_master_clock(VideoState *is)
 	return get_clock(&is->audclk);
 }
 
-/* seek in the stream */
-static void stream_seek(VideoState *is, int64_t pos, int64_t rel,
-                        int seek_by_bytes)
-{
-	if (!is->seek_req) {
-		is->seek_pos = pos;
-		is->seek_rel = rel;
-		is->seek_flags &= ~AVSEEK_FLAG_BYTE;
-		if (seek_by_bytes)
-			is->seek_flags |= AVSEEK_FLAG_BYTE;
-		is->seek_req = 1;
-		SDL_CondSignal(is->continue_read_thread);
-	}
-}
-
 static void update_volume(VideoState *is, int sign, int step)
 {
 	is->audio_volume = av_clip(is->audio_volume + sign * step, 0,
@@ -964,8 +929,7 @@ static double vp_duration(VideoState *is, Frame *vp, Frame *nextvp)
 	}
 }
 
-static void update_video_pts(VideoState *is, double pts, int64_t pos,
-                             int serial)
+static void update_video_pts(VideoState *is, double pts, int serial)
 {
 	/* update current video pts */
 	set_clock(&is->vidclk, pts, serial);
@@ -1023,7 +987,7 @@ retry:
 
 			SDL_LockMutex(is->pictq.mutex);
 			if (!isnan(vp->pts))
-				update_video_pts(is, vp->pts, vp->pos, vp->serial);
+				update_video_pts(is, vp->pts, vp->serial);
 			SDL_UnlockMutex(is->pictq.mutex);
 
 			if (frame_queue_nb_remaining(&is->pictq) > 1) {
@@ -2040,8 +2004,7 @@ static int read_thread(void *arg)
 
 	if (is->video_stream < 0 && is->audio_stream < 0) {
 		av_log(NULL, AV_LOG_FATAL,
-		       "Failed to open file '%s' or configure filtergraph\n",
-		       is->filename);
+		       "Failed to open file '%s' or configure filtergraph\n", is->filename);
 		ret = -1;
 		goto fail;
 	}
@@ -2050,39 +2013,6 @@ static int read_thread(void *arg)
 		if (is->abort_request)
 			break;
 
-		if (is->seek_req) {
-			int64_t seek_target = is->seek_pos;
-			int64_t seek_min = is->seek_rel > 0 ? seek_target - is->seek_rel + 2 :
-			                   INT64_MIN;
-			int64_t seek_max = is->seek_rel < 0 ? seek_target - is->seek_rel - 2 :
-			                   INT64_MAX;
-			// FIXME the +-2 is due to rounding being not done in the correct direction in generation
-			//      of the seek_pos/seek_rel variables
-
-			ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max,
-			                         is->seek_flags);
-			if (ret < 0) {
-				av_log(NULL, AV_LOG_ERROR,
-				       "%s: error while seeking\n", is->ic->filename);
-			} else {
-				if (is->audio_stream >= 0) {
-					packet_queue_flush(&is->audioq);
-					packet_queue_put(&is->audioq, &flush_pkt);
-				}
-				if (is->video_stream >= 0) {
-					packet_queue_flush(&is->videoq);
-					packet_queue_put(&is->videoq, &flush_pkt);
-				}
-				if (is->seek_flags & AVSEEK_FLAG_BYTE) {
-					set_clock(&is->extclk, NAN, 0);
-				} else {
-					set_clock(&is->extclk, seek_target / (double)AV_TIME_BASE, 0);
-				}
-			}
-			is->seek_req = 0;
-			is->queue_attachments_req = 1;
-			is->eof = 0;
-		}
 		if (is->queue_attachments_req) {
 			if (is->video_st && is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) {
 				AVPacket copy;
@@ -2109,9 +2039,7 @@ static int read_thread(void *arg)
 		                       frame_queue_nb_remaining(&is->sampq) == 0)) &&
 		    (!is->video_st || (is->viddec.finished == is->videoq.serial &&
 		                       frame_queue_nb_remaining(&is->pictq) == 0))) {
-			if (loop != 1 && (!loop || --loop)) {
-				stream_seek(is, start_time != AV_NOPTS_VALUE ? start_time : 0, 0, 0);
-			} else if (autoexit) {
+			if (autoexit) {
 				ret = AVERROR_EOF;
 				goto fail;
 			}
@@ -2226,7 +2154,6 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
 static void event_loop(VideoState *cur_stream)
 {
 	SDL_Event event;
-	double incr, pos;
 
 	while (1) {
 		refresh_loop_wait_event(cur_stream, &event);
@@ -2239,22 +2166,6 @@ static void event_loop(VideoState *cur_stream)
 			case SDLK_DOWN:
 				update_volume(cur_stream, -1, SDL_VOLUME_STEP);
 				break;
-			case SDLK_LEFT:
-				incr = -10.0;
-				goto do_seek;
-			case SDLK_RIGHT:
-				incr = 10.0;
-				goto do_seek;
-do_seek:
-				pos = get_master_clock(cur_stream);
-				if (isnan(pos))
-					pos = (double)cur_stream->seek_pos / AV_TIME_BASE;
-				pos += incr;
-				if (cur_stream->ic->start_time != AV_NOPTS_VALUE &&
-				    pos < cur_stream->ic->start_time / (double)AV_TIME_BASE)
-					pos = cur_stream->ic->start_time / (double)AV_TIME_BASE;
-				stream_seek(cur_stream, (int64_t)(pos * AV_TIME_BASE),
-				            (int64_t)(incr * AV_TIME_BASE), 0);
 			default:
 				break;
 			}
