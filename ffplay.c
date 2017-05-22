@@ -180,7 +180,6 @@ typedef struct VideoState {
 	AVInputFormat *iformat;
 	int abort_request;
 	int force_refresh;
-	int queue_attachments_req;
 	int seek_flags;
 	int64_t seek_pos;
 	int64_t seek_rel;
@@ -265,12 +264,8 @@ static int default_width = 640;
 static int default_height = 480;
 static int screen_width = 0;
 static int screen_height = 0;
-static int64_t start_time = AV_NOPTS_VALUE;
-static int64_t duration = AV_NOPTS_VALUE;
 static int decoder_reorder_pts = -1;
-static int autoexit = 1;
 static int framedrop = -1;
-static int infinite_buffer = -1;
 double rdftspeed = 0.02;
 static const char **vfilters_list = NULL;
 static char *afilters = NULL;
@@ -1435,20 +1430,16 @@ static int video_thread(void *arg)
 	int ret;
 	AVRational tb = is->video_st->time_base;
 	AVRational frame_rate = av_guess_frame_rate(is->ic, is->video_st, NULL);
-	AVFilterGraph *graph = avfilter_graph_alloc();
+	AVFilterGraph *graph = NULL;
 	AVFilterContext *filt_out = NULL, *filt_in = NULL;
 	int last_w = 0;
 	int last_h = 0;
 	enum AVPixelFormat last_format = -2;
 	int last_serial = -1;
 	int last_vfilter_idx = 0;
-	if (!graph) {
-		return AVERROR(ENOMEM);
-	}
 
 	frame = av_frame_alloc();
 	if (!frame) {
-		avfilter_graph_free(&graph);
 		return AVERROR(ENOMEM);
 	}
 
@@ -1469,7 +1460,8 @@ static int video_thread(void *arg)
 			       last_serial, frame->width, frame->height,
 			       (const char *)av_x_if_null(av_get_pix_fmt_name(frame->format), "none"),
 			       is->viddec.pkt_serial);
-			avfilter_graph_free(&graph);
+			if (graph != NULL)
+				avfilter_graph_free(&graph);
 			graph = avfilter_graph_alloc();
 			if ((ret = configure_video_filters(graph, is,
 			                                   vfilters_list ? vfilters_list[is->vfilter_idx] : NULL, frame)) < 0) {
@@ -1876,7 +1868,6 @@ static int stream_component_open(VideoState *is, int stream_index)
 		decoder_init(&is->viddec, avctx, &is->videoq, is->continue_read_thread);
 		if ((ret = decoder_start(&is->viddec, video_thread, is)) < 0)
 			goto out;
-		is->queue_attachments_req = 1;
 		break;
 	default:
 		break;
@@ -1914,13 +1905,10 @@ static int read_thread(void *arg)
 	int err, i, ret;
 	int st_index[AVMEDIA_TYPE_NB];
 	AVPacket pkt1, *pkt = &pkt1;
-	int64_t stream_start_time;
-	int pkt_in_play_range = 0;
 	AVDictionaryEntry *t;
 	AVDictionary **opts;
 	int orig_nb_streams;
 	SDL_mutex *wait_mutex = SDL_CreateMutex();
-	int64_t pkt_ts;
 
 	if (!wait_mutex) {
 		av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
@@ -2013,20 +2001,8 @@ static int read_thread(void *arg)
 		if (is->abort_request)
 			break;
 
-		if (is->queue_attachments_req) {
-			if (is->video_st && is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) {
-				AVPacket copy;
-				if ((ret = av_copy_packet(&copy, &is->video_st->attached_pic)) < 0)
-					goto fail;
-				packet_queue_put(&is->videoq, &copy);
-				packet_queue_put_nullpacket(&is->videoq, is->video_stream);
-			}
-			is->queue_attachments_req = 0;
-		}
-
 		/* if the queue are full, no need to read more */
-		if (infinite_buffer < 1 &&
-		    (is->audioq.size + is->videoq.size > MAX_QUEUE_SIZE ||
+		if ((is->audioq.size + is->videoq.size > MAX_QUEUE_SIZE ||
 		     (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
 		      stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq)))) {
 			/* wait 10 ms */
@@ -2039,10 +2015,8 @@ static int read_thread(void *arg)
 		                       frame_queue_nb_remaining(&is->sampq) == 0)) &&
 		    (!is->video_st || (is->viddec.finished == is->videoq.serial &&
 		                       frame_queue_nb_remaining(&is->pictq) == 0))) {
-			if (autoexit) {
-				ret = AVERROR_EOF;
-				goto fail;
-			}
+			ret = AVERROR_EOF;
+			goto fail;
 		}
 		ret = av_read_frame(ic, pkt);
 		if (ret < 0) {
@@ -2062,18 +2036,10 @@ static int read_thread(void *arg)
 		} else {
 			is->eof = 0;
 		}
-		/* check if packet is in play range specified by user, then queue, otherwise discard */
-		stream_start_time = ic->streams[pkt->stream_index]->start_time;
-		pkt_ts = pkt->pts == AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
-		pkt_in_play_range = duration == AV_NOPTS_VALUE ||
-		                    (pkt_ts - (stream_start_time != AV_NOPTS_VALUE ? stream_start_time : 0)) *
-		                    av_q2d(ic->streams[pkt->stream_index]->time_base) -
-		                    (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000
-		                    <= ((double)duration / 1000000);
-		if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
+
+		if (pkt->stream_index == is->audio_stream) {
 			packet_queue_put(&is->audioq, pkt);
-		} else if (pkt->stream_index == is->video_stream && pkt_in_play_range
-		           && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+		} else if (pkt->stream_index == is->video_stream) {
 			packet_queue_put(&is->videoq, pkt);
 		} else {
 			av_packet_unref(pkt);
